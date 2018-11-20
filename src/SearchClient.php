@@ -3,7 +3,8 @@
 namespace Algolia\AlgoliaSearch;
 
 use Algolia\AlgoliaSearch\Response\DeleteApiKeyResponse;
-use Algolia\AlgoliaSearch\Response\MultipleIndexingResponse;
+use Algolia\AlgoliaSearch\Response\IndexingResponse;
+use Algolia\AlgoliaSearch\Response\MultipleIndexBatchIndexingResponse;
 use Algolia\AlgoliaSearch\Response\AddApiKeyResponse;
 use Algolia\AlgoliaSearch\Response\UpdateApiKeyResponse;
 use Algolia\AlgoliaSearch\RequestOptions\RequestOptions;
@@ -77,6 +78,74 @@ class SearchClient
         return new SearchIndex($indexName, $this->api, $this->config);
     }
 
+    public function getAppId()
+    {
+        return $this->config->getAppId();
+    }
+
+    public function moveIndex($srcIndexName, $newIndexName, $requestOptions = array())
+    {
+        $response = $this->api->write(
+            'POST',
+            api_path('/1/indexes/%s/operation', $srcIndexName),
+            array(
+                'operation' => 'move',
+                'destination' => $newIndexName,
+            ),
+            $requestOptions
+        );
+
+        return new IndexingResponse($response, $this->initIndex($srcIndexName));
+    }
+
+    public function copyIndex($srcIndexName, $destIndexName, $requestOptions = array())
+    {
+        $response = $this->api->write(
+            'POST',
+            api_path('/1/indexes/%s/operation', $srcIndexName),
+            array(
+                'operation' => 'copy',
+                'destination' => $destIndexName,
+            ),
+            $requestOptions
+        );
+
+        return new IndexingResponse($response, $this->initIndex($srcIndexName));
+    }
+
+    public function copySettings($srcIndexName, $destIndexName, $requestOptions = array())
+    {
+        if (is_array($requestOptions)) {
+            $requestOptions['scope'] = array('settings');
+        } elseif ($requestOptions instanceof RequestOptions) {
+            $requestOptions->addBodyParameter('scope', array('settings'));
+        }
+
+        return $this->copyIndex($srcIndexName, $destIndexName, $requestOptions);
+    }
+
+    public function copySynonyms($srcIndexName, $destIndexName, $requestOptions = array())
+    {
+        if (is_array($requestOptions)) {
+            $requestOptions['scope'] = array('synonyms');
+        } elseif ($requestOptions instanceof RequestOptions) {
+            $requestOptions->addBodyParameter('scope', array('synonyms'));
+        }
+
+        return $this->copyIndex($srcIndexName, $destIndexName, $requestOptions);
+    }
+
+    public function copyRules($srcIndexName, $destIndexName, $requestOptions = array())
+    {
+        if (is_array($requestOptions)) {
+            $requestOptions['scope'] = array('rules');
+        } elseif ($requestOptions instanceof RequestOptions) {
+            $requestOptions->addBodyParameter('scope', array('rules'));
+        }
+
+        return $this->copyIndex($srcIndexName, $destIndexName, $requestOptions);
+    }
+
     public function isAlive($requestOptions = array())
     {
         return $this->api->read('GET', api_path('/1/isalive'), $requestOptions);
@@ -108,7 +177,7 @@ class SearchClient
             $requestOptions
         );
 
-        return new MultipleIndexingResponse($response, $this);
+        return new MultipleIndexBatchIndexingResponse($response, $this);
     }
 
     public function multipleGetObjects($requests, $requestOptions = array())
@@ -254,7 +323,7 @@ class SearchClient
     {
         $index = $this->initIndex($indexName);
 
-        return $index->waitTask($taskId, $requestOptions);
+        $index->waitTask($taskId, $requestOptions);
     }
 
     public function custom($method, $path, $requestOptions = array(), $hosts = null)

@@ -4,14 +4,14 @@ namespace Algolia\AlgoliaSearch;
 
 use Algolia\AlgoliaSearch\Config\SearchConfig;
 use Algolia\AlgoliaSearch\Exceptions\MissingObjectId;
-use Algolia\AlgoliaSearch\Response\IndexingObjectsResponse;
+use Algolia\AlgoliaSearch\Response\BatchIndexingResponse;
 use Algolia\AlgoliaSearch\Response\IndexingResponse;
 use Algolia\AlgoliaSearch\RequestOptions\RequestOptions;
 use Algolia\AlgoliaSearch\Iterators\ObjectIterator;
 use Algolia\AlgoliaSearch\Iterators\RuleIterator;
 use Algolia\AlgoliaSearch\Iterators\SynonymIterator;
+use Algolia\AlgoliaSearch\Response\MultiResponse;
 use Algolia\AlgoliaSearch\RetryStrategy\ApiWrapperInterface;
-use Algolia\AlgoliaSearch\Support\AbstractIndexContent;
 use Algolia\AlgoliaSearch\Support\Helpers;
 
 class SearchIndex
@@ -40,11 +40,9 @@ class SearchIndex
         return $this->indexName;
     }
 
-    public function setIndexName($indexName)
+    public function getAppId()
     {
-        $this->indexName = $indexName;
-
-        return $this;
+        return $this->config->getAppId();
     }
 
     public function search($query, $requestOptions = array())
@@ -71,59 +69,6 @@ class SearchIndex
             api_path('/1/indexes/%s/facets/%s/query', $this->indexName, $facetName),
             $requestOptions
         );
-    }
-
-    public function moveTo($newIndexName, $requestOptions = array())
-    {
-        $response = $this->api->write(
-            'POST',
-            api_path('/1/indexes/%s/operation', $this->indexName),
-            array(
-                'operation' => 'move',
-                'destination' => $newIndexName,
-            ),
-            $requestOptions
-        );
-
-        $this->setIndexName($newIndexName);
-
-        return new IndexingResponse($response, $this);
-    }
-
-    public function copyTo($destIndexName, $requestOptions = array())
-    {
-        $response = $this->api->write(
-            'POST',
-            api_path('/1/indexes/%s/operation', $this->indexName),
-            array(
-                'operation' => 'copy',
-                'destination' => $destIndexName,
-            ),
-            $requestOptions
-        );
-
-        return new IndexingResponse($response, $this);
-    }
-
-    public function copyIndexToApp($newAppId, $newApiKey, $requestOptions = array())
-    {
-        $allResponses = array();
-
-        $newIndex = SearchClient::create($newAppId, $newApiKey)->initIndex($this->indexName);
-
-        $settings = $this->getSettings();
-        $allResponses[] = $newIndex->setSettings($settings);
-
-        $objectsIterator = $this->browseObjects();
-        $allResponses[] = $newIndex->saveObjects($objectsIterator);
-
-        $synonymsIterator = $this->browseSynonyms();
-        $allResponses[] = $newIndex->saveSynonyms($synonymsIterator);
-
-        $rulesIterator = $this->browseRules();
-        $allResponses[] = $newIndex->saveRules($rulesIterator);
-
-        return $allResponses;
     }
 
     public function getSettings($requestOptions = array())
@@ -157,17 +102,6 @@ class SearchIndex
         );
 
         return new IndexingResponse($response, $this);
-    }
-
-    public function copySettingsTo($destIndexName, $requestOptions = array())
-    {
-        if (is_array($requestOptions)) {
-            $requestOptions['scope'] = array('settings');
-        } elseif ($requestOptions instanceof RequestOptions) {
-            $requestOptions->addBodyParameter('scope', array('settings'));
-        }
-
-        return $this->copyTo($destIndexName, $requestOptions);
     }
 
     public function getObject($objectId, $requestOptions = array())
@@ -272,7 +206,7 @@ class SearchIndex
         unset($requestOptions['safe']);
 
         $tmpName = $this->indexName.'_tmp_'.uniqid('php_', true);
-        $tmpIndex = new self($tmpName, $this->api, $this->config);
+        $tmpIndex = new static($tmpName, $this->api, $this->config);
 
         // Copy all index resources from production index
         $copyResponse = $this->copyTo($tmpIndex->getIndexName(), array(
@@ -291,9 +225,13 @@ class SearchIndex
         }
 
         // Move temporary index to production
-        $moveResponse = $tmpIndex->moveTo($this->indexName);
+        $moveResponse = $this->moveFrom($tmpName);
 
-        return array($copyResponse, $batchResponse, $moveResponse);
+        if ($safe) {
+            $moveResponse->wait();
+        }
+
+        return new MultiResponse(array($copyResponse, $batchResponse, $moveResponse));
     }
 
     public function deleteObject($objectId, $requestOptions = array())
@@ -377,7 +315,7 @@ class SearchIndex
         }
         $allResponses[] = $this->rawBatch(Helpers::buildBatch($batch, $action), $requestOptions);
 
-        return new IndexingObjectsResponse($allResponses, $this);
+        return new BatchIndexingResponse($allResponses, $this);
     }
 
     public function browseObjects($requestOptions = array())
@@ -440,17 +378,6 @@ class SearchIndex
         );
 
         return new IndexingResponse($response, $this);
-    }
-
-    public function copySynonymsTo($destIndexName, $requestOptions = array())
-    {
-        if (is_array($requestOptions)) {
-            $requestOptions['scope'] = array('synonyms');
-        } elseif ($requestOptions instanceof RequestOptions) {
-            $requestOptions->addBodyParameter('scope', array('synonyms'));
-        }
-
-        return $this->copyTo($destIndexName, $requestOptions);
     }
 
     public function replaceAllSynonyms($synonyms, $requestOptions = array())
@@ -562,17 +489,6 @@ class SearchIndex
         return new IndexingResponse($response, $this);
     }
 
-    public function copyRulesTo($destIndexName, $requestOptions = array())
-    {
-        if (is_array($requestOptions)) {
-            $requestOptions['scope'] = array('rules');
-        } elseif ($requestOptions instanceof RequestOptions) {
-            $requestOptions->addBodyParameter('scope', array('rules'));
-        }
-
-        return $this->copyTo($destIndexName, $requestOptions);
-    }
-
     public function replaceAllRules($rules, $requestOptions = array())
     {
         if (is_array($requestOptions)) {
@@ -661,68 +577,6 @@ class SearchIndex
         return $this->api->send($method, $path, $requestOptions, $hosts);
     }
 
-    public function reindex(AbstractIndexContent $indexContent, $requestOptions = array())
-    {
-        $safe = isset($requestOptions['safe']) && $requestOptions['safe'];
-        unset($requestOptions['safe']);
-        $allResponses = array();
-        $replicas = false;
-
-        $tmpName = $this->indexName.'_tmp_'.uniqid('php_', true);
-        $tmpIndex = new self($tmpName, $this->api, $this->config);
-
-        if (false === $settings = $indexContent->getSettings()) {
-            $scope[] = 'settings';
-        }
-        if (false === $synonyms = $indexContent->getSynonyms()) {
-            $scope[] = 'synonyms';
-        }
-        if (false === $rules = $indexContent->getRules()) {
-            $scope[] = 'rules';
-        }
-
-        if (!empty($scope)) {
-            $allResponses[] = $this->copyTo($tmpName, $scope);
-        }
-
-        if ($settings) {
-            if (isset($settings['replicas'])) {
-                $replicas = $settings['replicas'];
-                unset($settings['replicas']);
-            }
-            $allResponses[] = $tmpIndex->setSettings($settings);
-        }
-
-        if ($synonyms) {
-            $allResponses[] = $tmpIndex->saveSynonyms($synonyms);
-        }
-
-        if ($rules) {
-            $allResponses[] = $tmpIndex->saveRules($rules);
-        }
-
-        $allResponses[] = $tmpIndex->saveObjects($indexContent->getObjects());
-
-        if ($safe) {
-            foreach ($allResponses as $response) {
-                $response->wait();
-            }
-        }
-
-        $moveResponse = $tmpIndex->moveTo($this->indexName);
-
-        if ($safe) {
-            $moveResponse->wait();
-        }
-        $allResponses[] = $moveResponse;
-
-        if ($replicas) {
-            $allResponses[] = $this->setSettings(array('replicas' => $settings));
-        }
-
-        return $allResponses;
-    }
-
     public function delete($requestOptions = array())
     {
         $response = $this->api->write(
@@ -733,5 +587,35 @@ class SearchIndex
         );
 
         return new IndexingResponse($response, $this);
+    }
+
+    private function copyTo($tmpIndexName, $requestOptions = array())
+    {
+        $apiResponse = $this->api->write(
+            'POST',
+            api_path('/1/indexes/%s/operation', $this->indexName),
+            array(
+                'operation' => 'copy',
+                'destination' => $tmpIndexName,
+            ),
+            $requestOptions
+        );
+
+        return new IndexingResponse($apiResponse, $this);
+    }
+
+    private function moveFrom($tmpIndexName, $requestOptions = array())
+    {
+        $apiResponse = $this->api->write(
+            'POST',
+            api_path('/1/indexes/%s/operation', $tmpIndexName),
+            array(
+                'operation' => 'move',
+                'destination' => $this->indexName,
+            ),
+            $requestOptions
+        );
+
+        return new IndexingResponse($apiResponse, $this);
     }
 }
